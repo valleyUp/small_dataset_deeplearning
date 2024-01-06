@@ -13,43 +13,41 @@ from torch import nn
 from torch.utils.data import random_split
 from torchmetrics.functional import accuracy
 from optuna.integration import PyTorchLightningPruningCallback
+from optuna.visualization import plot_optimization_history, plot_param_importances
+
+from model import ResNetBinaryClassifier
 
 # 重构网络结构为 LightningModule
 class LitModel(pl.LightningModule):
-    def __init__(self, input_size, hidden_size, num_classes, dropout_prob, lr, weight_decay):
+    def __init__(self, input_size, hidden_size, dropout_prob, lr, weight_decay):
         super().__init__()
 
         self.save_hyperparameters()
 
-        self.model = nn.Sequential(
-            nn.Linear(input_size, hidden_size),
-            nn.ReLU(),
-            nn.Dropout(dropout_prob),
-            nn.Linear(hidden_size, 128),
-            nn.ReLU(),
-            nn.Dropout(dropout_prob),
-            nn.Linear(128, num_classes)
-        )
         self.criterion = nn.CrossEntropyLoss()
+        self.model = ResNetBinaryClassifier(
+            input_size=input_size,
+            layer_sizes=hidden_size,
+            dropout_prob=dropout_prob
+        )
 
     def forward(self, x):
         return self.model(x)
-
-    def training_step(self, batch, batch_idx):
+    
+    def _step(self, batch):
         x, y = batch
         y_hat = self.model(x)
         loss = self.criterion(y_hat, y)
+        return loss
+
+    def training_step(self, batch, batch_idx):
+        loss = self._step(batch=batch)
         self.log('train_loss', loss)
         return loss
 
     def validation_step(self, batch, batch_idx):
-        x, y = batch
-        y_hat = self.model(x)
-        loss = self.criterion(y_hat, y)
-        preds = torch.argmax(y_hat, dim=1)
-        acc = accuracy(preds, y, 'binary')
+        loss = self._step(batch=batch)
         self.log('val_loss', loss)
-        self.log('val_acc', acc, on_epoch=True)
         return loss
     
     def test_step(self, batch, batch_idx):
@@ -69,8 +67,6 @@ class LitDataModule(pl.LightningDataModule):
         self.batch_size = batch_size
         super().__init__()
         
-    #def prepare_data(self) -> None:
-        
     def setup(self, stage: str) -> None:
         scaler = StandardScaler()
         dat = pd.read_csv("./diabetes.csv")
@@ -80,32 +76,34 @@ class LitDataModule(pl.LightningDataModule):
         self.train_dataset, self.val_dataset, self.test_dataset = random_split(self.dataset, [0.6, 0.2, 0.2])
 
     def train_dataloader(self):
-        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True, num_workers=os.cpu_count())
+        return DataLoader(self.train_dataset, batch_size=self.batch_size, shuffle=True)
 
     def val_dataloader(self):
-        return DataLoader(self.val_dataset, batch_size=self.batch_size, num_workers=os.cpu_count())
+        return DataLoader(self.val_dataset, batch_size=self.batch_size)
 
-    def test_dataloader(self) -> EVAL_DATALOADERS:
-        return DataLoader(self.test_dataset, batch_size=self.batch_size, num_workers=os.cpu_count())
+    def test_dataloader(self):
+        return DataLoader(self.test_dataset, batch_size=self.batch_size)
 
 # 定义目标函数，这个函数将被Optuna调用来优化超参数
 def objective(trial):
     # 超参数搜索空间
-    dropout_prob = trial.suggest_float('dropout_prob', 0.5, 0.8)
-    lr = trial.suggest_float('lr', 1e-6, 1e-3, log=True)
+    dropout_prob = trial.suggest_float('dropout_prob', 0.3, 0.8)
+    lr = trial.suggest_float('lr', 1e-5, 1e-3, log=True)
     weight_decay = trial.suggest_float('weight_decay', 1e-8, 1e-4, log=True)
-    hidden_size = trial.suggest_int('hidden_size', 64, 256)
+    h1 = trial.suggest_int('h1', 32, 512)
+    h2 = trial.suggest_int('h2', 32, 512)
+    h3 = trial.suggest_int('h3', 32, 512)
+    h4 = trial.suggest_int('h4', 32, 512)
+    h5 = trial.suggest_int('h5', 32, 512)
     batch_size = trial.suggest_int('batch_size', 8, 64)
 
     # 创建数据模块
     datamodule = LitDataModule(batch_size=batch_size)
-    # trainloader, valloader, testloader = load_data(batch_size)
 
     # 创建模型
     model = LitModel(
         input_size=8,
-        hidden_size=hidden_size,
-        num_classes=2,
+        hidden_size=[h1, h2, h3, h4, h5],
         dropout_prob=dropout_prob,
         lr=lr,
         weight_decay=weight_decay
@@ -116,7 +114,8 @@ def objective(trial):
         logger=TensorBoardLogger(save_dir='./'),
         enable_progress_bar=False,
         enable_model_summary=False,
-        max_epochs=300,
+        log_every_n_steps=5,
+        max_epochs=500,
         callbacks=[
             PyTorchLightningPruningCallback(trial, monitor="val_loss"),  # 将 Optuna 子试验与 PyTorch Lightning callback 结合
             EarlyStopping(monitor='val_loss', patience=20, mode='min'),
@@ -125,23 +124,25 @@ def objective(trial):
     )
 
     # 训练
-    #trainer.fit(model, train_dataloaders=trainloader, val_dataloaders=valloader)
-    #trainer.test(model, testloader, 'best')
     trainer.fit(model=model, datamodule=datamodule)
     trainer.test(model=model, datamodule=datamodule, ckpt_path='best')
 
     # 获取验证集上的损失
-    val_loss = trainer.callback_metrics['test_acc'].item()
+    test_acc = trainer.callback_metrics['test_acc'].item()
 
-    return val_loss
+    return test_acc
 
 # 创建一个 Optuna 研究（Study），并找到最佳超参数
 study = optuna.create_study(
     direction='maximize',
-    sampler=optuna.samplers.TPESampler(),
-    pruner=optuna.pruners.MedianPruner(n_startup_trials=5, n_warmup_steps=30),
+    sampler=optuna.samplers.RandomSampler(),
+    pruner=optuna.pruners.HyperbandPruner(),
 )
-study.optimize(objective, n_trials=30)
+study.optimize(objective, n_trials=200)
+history = plot_optimization_history(study)
+history.write_image('history.png')
+importance = plot_param_importances(study)
+importance.write_image('importance.png')
 
 print('Number of finished trials:', len(study.trials))
 print('Best trial:')

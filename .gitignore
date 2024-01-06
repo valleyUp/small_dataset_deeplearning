@@ -1,3 +1,7 @@
+# lightning logs
+lightning_logs/
+*.png
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]

@@ -39,7 +39,7 @@ class ResNetBinaryClassifier(nn.Module):
             current_size = output_size  # 更新层的尺寸
         
         # 定义输出层
-        self.output = nn.Linear(layer_sizes[-1], 1)
+        self.output = nn.Linear(layer_sizes[-1], 2)
 
     def forward(self, x):
         for layer in self.layers:
